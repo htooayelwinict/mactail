@@ -126,32 +126,37 @@ class Store:
     ) -> int:
         """Insert every snapshot as the initial baseline. Returns rows written."""
         written = 0
-        for snap in snapshots:
-            if isinstance(snap, ParseError):
-                continue
-            self._db.execute(
-                """
-                INSERT INTO plists
-                    (path, kind, current_hash, first_seen_run, last_seen_run, last_status)
-                VALUES (?, ?, ?, ?, ?, 'seen')
-                """,
-                (str(snap.path), snap.kind.value, snap.content_hash, run_id, run_id),
-            )
-            self._db.execute(
-                """
-                INSERT INTO plist_history (path, run_id, content_hash, mtime_ns, size, status)
-                VALUES (?, ?, ?, ?, ?, 'seen')
-                """,
-                (
-                    str(snap.path),
-                    run_id,
-                    snap.content_hash,
-                    snap.mtime_ns,
-                    snap.size,
-                ),
-            )
-            written += 1
-        self._db.commit()
+        try:
+            self._db.execute("BEGIN")
+            for snap in snapshots:
+                if isinstance(snap, ParseError):
+                    continue
+                self._db.execute(
+                    """
+                    INSERT INTO plists
+                        (path, kind, current_hash, first_seen_run, last_seen_run, last_status)
+                    VALUES (?, ?, ?, ?, ?, 'seen')
+                    """,
+                    (str(snap.path), snap.kind.value, snap.content_hash, run_id, run_id),
+                )
+                self._db.execute(
+                    """
+                    INSERT INTO plist_history (path, run_id, content_hash, mtime_ns, size, status)
+                    VALUES (?, ?, ?, ?, ?, 'seen')
+                    """,
+                    (
+                        str(snap.path),
+                        run_id,
+                        snap.content_hash,
+                        snap.mtime_ns,
+                        snap.size,
+                    ),
+                )
+                written += 1
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
         return written
 
     def record_current(
@@ -175,76 +180,85 @@ class Store:
         parse_errors = 0
         current_paths: set[str] = set()
 
-        for snap in snapshots:
-            if isinstance(snap, ParseError):
-                parse_errors += 1
-                continue
-            current_paths.add(str(snap.path))
-            row = self._db.execute(
-                "SELECT id, current_hash FROM plists WHERE path = ?", (str(snap.path),)
-            ).fetchone()
-
-            if row is None:
-                self._db.execute(
-                    """
-                    INSERT INTO plists
-                        (path, kind, current_hash, first_seen_run, last_seen_run, last_status)
-                    VALUES (?, ?, ?, ?, ?, 'seen')
-                    """,
-                    (str(snap.path), snap.kind.value, snap.content_hash, run_id, run_id),
-                )
-                new_count += 1
-            else:
-                if row["current_hash"] != snap.content_hash:
-                    self._db.execute(
-                        "UPDATE plists SET current_hash = ?, last_seen_run = ? WHERE id = ?",
-                        (snap.content_hash, run_id, row["id"]),
-                    )
-                    changed_count += 1
-                else:
-                    self._db.execute(
-                        "UPDATE plists SET last_seen_run = ? WHERE id = ?",
-                        (run_id, row["id"]),
-                    )
-
-            self._db.execute(
-                """
-                INSERT INTO plist_history (path, run_id, content_hash, mtime_ns, size, status)
-                VALUES (?, ?, ?, ?, ?, 'seen')
-                """,
-                (
-                    str(snap.path),
-                    run_id,
-                    snap.content_hash,
-                    snap.mtime_ns,
-                    snap.size,
-                ),
-            )
-            seen_count += 1
-
-        # Mark paths not seen this run as 'missing' (but only if previously seen).
-        prev_seen = {
-            row["path"]
+        # Batch-load existing paths to avoid N+1 SELECTs.
+        existing: dict[str, tuple[int, str]] = {
+            row["path"]: (int(row["id"]), row["current_hash"])
             for row in self._db.execute(
-                "SELECT path FROM plists WHERE last_status = 'seen'"
+                "SELECT id, path, current_hash FROM plists"
             ).fetchall()
         }
-        missing_now = prev_seen - current_paths
-        removed_count = 0
-        for path in sorted(missing_now):
-            self._db.execute(
-                "UPDATE plists SET last_status = 'missing' WHERE path = ?", (path,)
-            )
-            self._db.execute(
-                """
-                INSERT INTO plist_history (path, run_id, content_hash, mtime_ns, size, status)
-                VALUES (?, ?, '', 0, 0, 'missing')
-                """,
-                (path, run_id),
-            )
-            removed_count += 1
 
-        self._db.commit()
+        try:
+            self._db.execute("BEGIN")
+
+            for snap in snapshots:
+                if isinstance(snap, ParseError):
+                    parse_errors += 1
+                    continue
+                path_str = str(snap.path)
+                current_paths.add(path_str)
+                row = existing.get(path_str)
+
+                if row is None:
+                    self._db.execute(
+                        """
+                        INSERT INTO plists
+                            (path, kind, current_hash, first_seen_run, last_seen_run, last_status)
+                        VALUES (?, ?, ?, ?, ?, 'seen')
+                        """,
+                        (path_str, snap.kind.value, snap.content_hash, run_id, run_id),
+                    )
+                    new_count += 1
+                else:
+                    plist_id, prev_hash = row
+                    if prev_hash != snap.content_hash:
+                        self._db.execute(
+                            "UPDATE plists SET current_hash = ?, last_seen_run = ? WHERE id = ?",
+                            (snap.content_hash, run_id, plist_id),
+                        )
+                        changed_count += 1
+                    else:
+                        self._db.execute(
+                            "UPDATE plists SET last_seen_run = ? WHERE id = ?",
+                            (run_id, plist_id),
+                        )
+
+                self._db.execute(
+                    """
+                    INSERT INTO plist_history (path, run_id, content_hash, mtime_ns, size, status)
+                    VALUES (?, ?, ?, ?, ?, 'seen')
+                    """,
+                    (
+                        path_str,
+                        run_id,
+                        snap.content_hash,
+                        snap.mtime_ns,
+                        snap.size,
+                    ),
+                )
+                seen_count += 1
+
+            # Mark paths not seen this run as 'missing' (but only if previously seen).
+            missing_now = set(existing) - current_paths
+            removed_count = 0
+            for path in sorted(missing_now):
+                self._db.execute(
+                    "UPDATE plists SET last_status = 'missing' WHERE path = ?", (path,)
+                )
+                self._db.execute(
+                    """
+                    INSERT INTO plist_history (path, run_id, content_hash, mtime_ns, size, status)
+                    VALUES (?, ?, '', 0, 0, 'missing')
+                    """,
+                    (path, run_id),
+                )
+                removed_count += 1
+
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+
         return seen_count, new_count, changed_count, parse_errors, removed_count
 
     # ---- reads ---------------------------------------------------------
