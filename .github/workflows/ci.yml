@@ -21,9 +21,11 @@ jobs:
           cache-dependency-glob: "pyproject.toml"
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
+      - name: Create venv
+        run: uv venv --python ${{ matrix.python-version }} .venv
       - name: Install dependencies
-        run: uv pip install --python ${{ matrix.python-version }} --system -e ".[dev]"
+        run: uv pip install --python .venv/bin/python -e ".[dev]"
       - name: Lint
-        run: uv run --python ${{ matrix.python-version }} ruff check .
+        run: .venv/bin/ruff check .
       - name: Test
-        run: uv run --python ${{ matrix.python-version }} pytest -v
+        run: .venv/bin/pytest -v
