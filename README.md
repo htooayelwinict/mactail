@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/htooayelwinict/mactail/main/docs/logo.png" width="100" alt="mactail logo" onerror="this.style.display='none'" />
-</p>
-
-<p align="center">
   <b style="font-size:1.5em">m a c t a i l</b><br/>
   <sub>Local-first macOS launchd persistence baselining &amp; threat hunting.</sub>
 </p>
