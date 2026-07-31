@@ -15,6 +15,7 @@ import os
 import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 from mactail.persistence.parser import PlistSnapshot
 from mactail.persistence.scanner import PlistKind
@@ -135,20 +136,67 @@ def rule_suspicious_interpreter(snap: PlistSnapshot) -> Iterable[Finding]:
 
 
 def rule_run_at_load_and_keep_alive_unsigned(snap: PlistSnapshot) -> Iterable[Finding]:
+    """RunAtLoad + KeepAlive alone is medium; a non-Apple binary lifts it to high.
+
+    Inspects the *binary* the plist launches (Program or ProgramArguments[0]),
+    not the plist file itself — launchd validates what it runs, not what
+    describes it.
+    """
     if not (snap.run_at_load and snap.keep_alive):
         return ()
     if not snap.path.exists():
         return ()
-    # We don't have signature info here yet; treat the combination alone as
-    # medium (v0.1). A signature check upgrades to high when sigs land.
+
+    # Lazy import: sigs pulls in subprocess machinery. Rules stay import-cheap.
+    from mactail.persistence.sigs import inspect_cached
+
+    # Pick the binary: explicit Program wins, else first arg of ProgramArguments.
+    binary = None
+    if snap.program and snap.program not in _SUSPICIOUS_INTERPRETERS:
+        # snap.program is set from Program OR ProgramArguments[0]; if it's a
+        # shell we already covered via R-PROG-INTERPRETER.
+        binary = Path(snap.program)
+    if binary is None or not binary.exists():
+        # No resolvable binary -> fall back to the original medium finding.
+        return (
+            Finding(
+                severity="medium",
+                rule_id="R-RUN-KEEPALIVE",
+                path=str(snap.path),
+                evidence="RunAtLoad=true AND KeepAlive=true (binary not found for sig check)",
+                mitre="T1543.001",
+                recommendation="confirm the agent is from a known vendor",
+            ),
+        )
+
+    sig = inspect_cached(binary)
+    if sig.is_apple_signed:
+        return ()  # Apple-signed agent with run+keepalive is normal (e.g. system services)
+    if sig.is_signed:
+        return (
+            Finding(
+                severity="high",
+                rule_id="R-RUN-KEEPALIVE-UNSIGNED",
+                path=str(snap.path),
+                evidence=(
+                    f"RunAtLoad+KeepAlive, binary signed by non-Apple team "
+                    f"{sig.team_id or '?'} ({sig.signing_id or '?'})"
+                ),
+                mitre="T1543.001",
+                recommendation="verify the vendor is known and the binary is the expected version",
+            ),
+        )
     return (
         Finding(
-            severity="medium",
-            rule_id="R-RUN-KEEPALIVE",
+            severity="critical",
+            rule_id="R-RUN-KEEPALIVE-UNSIGNED",
             path=str(snap.path),
-            evidence="RunAtLoad=true AND KeepAlive=true",
+            evidence=(
+                f"RunAtLoad+KeepAlive, binary is unsigned "
+                f"({sig.error or 'codesign rejected'})"
+            ),
             mitre="T1543.001",
-            recommendation="confirm the agent is from a known vendor; will upgrade to high if unsigned",
+            recommendation="unsigned persistent launchd jobs are a top-tier threat indicator; quarantine",
         ),
     )
 

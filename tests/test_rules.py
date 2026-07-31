@@ -82,10 +82,94 @@ def test_suspicious_interpreter_clean(tmp_path: Path) -> None:
 # --- run-at-load + keep-alive --------------------------------------------
 
 
-def test_run_and_keepalive_triggers(tmp_path: Path) -> None:
+def test_run_and_keepalive_triggers_medium_when_no_binary(tmp_path: Path) -> None:
+    """RunAtLoad+KeepAlive with no Program -> falls back to medium (binary not found)."""
     s = _snap(tmp_path, "x.plist", {"Label": "x", "RunAtLoad": True, "KeepAlive": True})
     f = list(rule_run_at_load_and_keep_alive_unsigned(s))
     assert len(f) == 1 and f[0].severity == "medium"
+    assert f[0].rule_id == "R-RUN-KEEPALIVE"
+    assert "binary not found" in f[0].evidence
+
+
+def test_run_and_keepalive_critical_when_unsigned_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RunAtLoad+KeepAlive + binary exists + unsigned -> critical."""
+    binary = tmp_path / "evil"
+    binary.write_bytes(b"\xcf\xfa\xed\xfe")  # Mach-O magic (fake)
+    s = _snap(
+        tmp_path,
+        "x.plist",
+        {"Label": "x", "ProgramArguments": [str(binary)], "RunAtLoad": True, "KeepAlive": True},
+    )
+    from mactail.persistence import sigs
+    from mactail.persistence.sigs import SignatureInfo
+
+    monkeypatch.setattr(
+        sigs, "inspect_cached",
+        lambda p: SignatureInfo(
+            path=p, is_signed=False, team_id=None, signing_id=None,
+            is_apple_signed=False, is_hardened_runtime=False, error="not signed",
+        ),
+    )
+    f = list(rule_run_at_load_and_keep_alive_unsigned(s))
+    assert len(f) == 1 and f[0].severity == "critical"
+    assert f[0].rule_id == "R-RUN-KEEPALIVE-UNSIGNED"
+    assert "unsigned" in f[0].evidence.lower()
+
+
+def test_run_and_keepalive_high_when_non_apple_signed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RunAtLoad+KeepAlive + binary signed by non-Apple team -> high."""
+    binary = tmp_path / "vendor"
+    binary.write_bytes(b"\xcf\xfa\xed\xfe")
+    s = _snap(
+        tmp_path,
+        "x.plist",
+        {"Label": "x", "ProgramArguments": [str(binary)], "RunAtLoad": True, "KeepAlive": True},
+    )
+    from mactail.persistence import sigs
+    from mactail.persistence.sigs import SignatureInfo
+
+    monkeypatch.setattr(
+        sigs, "inspect_cached",
+        lambda p: SignatureInfo(
+            path=p, is_signed=True, team_id="ABCDE12345",
+            signing_id="com.example.vendor", is_apple_signed=False,
+            is_hardened_runtime=True, error=None,
+        ),
+    )
+    f = list(rule_run_at_load_and_keep_alive_unsigned(s))
+    assert len(f) == 1 and f[0].severity == "high"
+    assert f[0].rule_id == "R-RUN-KEEPALIVE-UNSIGNED"
+    assert "ABCDE12345" in f[0].evidence
+
+
+def test_run_and_keepalive_clean_when_apple_signed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RunAtLoad+KeepAlive + Apple-signed binary -> no finding."""
+    binary = tmp_path / "system_agent"
+    binary.write_bytes(b"\xcf\xfa\xed\xfe")
+    s = _snap(
+        tmp_path,
+        "x.plist",
+        {"Label": "x", "ProgramArguments": [str(binary)], "RunAtLoad": True, "KeepAlive": True},
+    )
+    from mactail.persistence import sigs
+    from mactail.persistence.sigs import SignatureInfo
+
+    monkeypatch.setattr(
+        sigs, "inspect_cached",
+        lambda p: SignatureInfo(
+            path=p, is_signed=True, team_id="APPLECOMPUTER",
+            signing_id="com.apple.agent", is_apple_signed=True,
+            is_hardened_runtime=True, error=None,
+        ),
+    )
+    f = list(rule_run_at_load_and_keep_alive_unsigned(s))
+    assert f == []
 
 
 def test_run_and_keepalive_off(tmp_path: Path) -> None:
